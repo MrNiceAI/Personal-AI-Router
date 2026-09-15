@@ -364,6 +364,25 @@ without sending the request to an engine. It does not broaden the candidate list
 or refresh inventory synchronously; a later discovery update makes a newly
 advertised owner eligible.
 
+The Ollama proxy also supports an opt-in exact-artifact capability gate. A
+model-bearing inference request with one valid
+`X-MrNiceAI-Expected-Artifact-Sha256` value triggers concurrent, bounded
+`/api/tags` reads through each already eligible candidate's normal transport.
+Only candidates with one unambiguous model record carrying that exact digest
+remain eligible. This request-local intersection preserves selection and
+scheduler order, happens before reservations or forwarding, and fails closed
+when no exact owner can be proven. The expected value is consumed at the proxy.
+Inventory redirects are not followed and process-wide concurrency is capped.
+At the response commit point, the proxy checks the candidate's `/api/ps`
+scheduler inventory and requires the requested model's loaded digest to equal
+the preselected digest. A missing, ambiguous, unavailable, or changed live
+record fails over before any response byte is released, or fails closed if the
+candidate list is exhausted. Any engine-supplied header or trailer named
+`X-MrNiceAI-Served-Artifact-Sha256` is removed and replaced with the immutable
+verified digest for the candidate that actually served the response, including
+after failover. Reserved request trailers are rejected or stripped. Requests
+without the expected header retain ordinary behavior.
+
 A request whose model cannot be parsed keeps the ordinary non-model ordering.
 
 Model listings are not routed at all. A `GET` of `/v1/models` or `/api/tags` is

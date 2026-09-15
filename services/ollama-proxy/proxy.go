@@ -382,6 +382,12 @@ type Proxy struct {
 	plainTransport *http.Transport
 	peerTransports map[string]*http.Transport
 
+	// artifactInventorySlots bounds all exact-artifact control-plane reads
+	// across concurrent client requests. A fixed worker pool also bounds each
+	// request independently; this process-wide gate prevents a request burst
+	// from multiplying the number of simultaneous /api/tags and /api/ps calls.
+	artifactInventorySlots chan struct{}
+
 	// nextRequestID is a monotonic counter for tagging RequestStarted /
 	// RequestEvent pairs. Atomic add returns the new value, so request
 	// IDs start at 1 and never collide within a single proxy lifetime.
@@ -403,12 +409,13 @@ type Proxy struct {
 
 func NewProxy(codec *Codec, discovery *Discovery, port int) *Proxy {
 	return &Proxy{
-		codec:     codec,
-		discovery: discovery,
-		port:      port,
-		targets:   reach.NewChooser(),
-		runID:     newRunID(),
-		activity:  nodeactivity.NewReporter(activityReportInterval),
+		codec:                  codec,
+		discovery:              discovery,
+		port:                   port,
+		targets:                reach.NewChooser(),
+		runID:                  newRunID(),
+		activity:               nodeactivity.NewReporter(activityReportInterval),
+		artifactInventorySlots: make(chan struct{}, maxArtifactInventoryConcurrency),
 	}
 }
 
@@ -533,9 +540,13 @@ const (
 	proxyIdleConnTimeout = 90 * time.Second
 	// Inbound http.Server limits — keep IdleTimeout aligned with client
 	// IdleConnTimeout so idle keep-alives are reaped on both sides.
-	proxyReadHeaderTimeout = 10 * time.Second
-	proxyServerIdleTimeout = 90 * time.Second
-	maxModelListBytes      = 16 << 20
+	proxyReadHeaderTimeout          = 10 * time.Second
+	proxyServerIdleTimeout          = 90 * time.Second
+	maxModelListBytes               = 16 << 20
+	maxArtifactInventoryConcurrency = 8
+
+	expectedArtifactSHA256Header = "X-MrNiceAI-Expected-Artifact-Sha256"
+	servedArtifactSHA256Header   = "X-MrNiceAI-Served-Artifact-Sha256"
 )
 
 // idleClientWriteTimeout bounds how long a single write of streamed response
@@ -851,9 +862,10 @@ func (p *Proxy) emitWorkload(method string, w Workload) {
 // pinned to that peer's exact server cert. Empty peerUUID means a plain-HTTP
 // dial — the local backend (self) or an explicit manual node.
 type candidate struct {
-	id       string
-	url      *url.URL
-	peerUUID string
+	id             string
+	url            *url.URL
+	peerUUID       string
+	artifactDigest string
 }
 
 // candidateTransport returns the reverse-proxy / model-list transport for a
@@ -952,6 +964,15 @@ type retrySignal struct{}
 
 func (retrySignal) Error() string { return "ollama-proxy: retry next candidate" }
 
+// artifactVerificationSignal aborts an upstream response whose live loaded-
+// model inventory cannot prove the requested digest. The failover loop may try
+// the next prequalified candidate, but the rejected response is never exposed.
+type artifactVerificationSignal struct{}
+
+func (artifactVerificationSignal) Error() string {
+	return "ollama-proxy: loaded artifact verification failed"
+}
+
 type modelListItem struct {
 	key    string
 	digest string
@@ -971,6 +992,285 @@ func ollamaModelKey(model string) string {
 		return model + ":latest"
 	}
 	return model
+}
+
+func headerValues(h http.Header, name string) []string {
+	var values []string
+	for key, current := range h {
+		if strings.EqualFold(key, name) {
+			values = append(values, current...)
+		}
+	}
+	return values
+}
+
+func removeHeader(h http.Header, name string) {
+	for key := range h {
+		if strings.EqualFold(key, name) {
+			delete(h, key)
+		}
+	}
+}
+
+func headerPresent(h http.Header, name string) bool {
+	for key := range h {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeTrailerDeclaration removes a reserved field from a comma-separated
+// Trailer declaration without disturbing unrelated trailer names.
+func removeTrailerDeclaration(h http.Header, name string) {
+	for key, values := range h {
+		if !strings.EqualFold(key, "Trailer") {
+			continue
+		}
+		kept := make([]string, 0, len(values))
+		for _, value := range values {
+			var names []string
+			for _, current := range strings.Split(value, ",") {
+				current = strings.TrimSpace(current)
+				if current != "" && !strings.EqualFold(current, name) {
+					names = append(names, current)
+				}
+			}
+			if len(names) > 0 {
+				kept = append(kept, strings.Join(names, ", "))
+			}
+		}
+		if len(kept) == 0 {
+			delete(h, key)
+		} else {
+			h[key] = kept
+		}
+	}
+}
+
+func removeReservedArtifactFields(h http.Header) {
+	removeHeader(h, expectedArtifactSHA256Header)
+	removeHeader(h, servedArtifactSHA256Header)
+	removeTrailerDeclaration(h, expectedArtifactSHA256Header)
+	removeTrailerDeclaration(h, servedArtifactSHA256Header)
+}
+
+type artifactTrailerSanitizingBody struct {
+	io.ReadCloser
+	trailer http.Header
+}
+
+func (b *artifactTrailerSanitizingBody) sanitize() {
+	removeReservedArtifactFields(b.trailer)
+}
+
+func (b *artifactTrailerSanitizingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		// net/http populates response trailer values only when the body reaches
+		// EOF. ReverseProxy copies trailers after that read, so sanitize here as
+		// well as in ModifyResponse.
+		b.sanitize()
+	}
+	return n, err
+}
+
+func (b *artifactTrailerSanitizingBody) Close() error {
+	b.sanitize()
+	return b.ReadCloser.Close()
+}
+
+func validArtifactSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func expectedArtifactSHA256(header, trailer http.Header) (string, bool, error) {
+	values := headerValues(header, expectedArtifactSHA256Header)
+	// The trust contract requires an ordinary request header. A trailer arrives
+	// only after the body is consumed and must never become a second input path.
+	if headerPresent(trailer, expectedArtifactSHA256Header) {
+		return "", true, fmt.Errorf("expected artifact digest is not accepted as a trailer")
+	}
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 || !validArtifactSHA256(values[0]) {
+		return "", true, fmt.Errorf("expected artifact digest must be exactly one lowercase SHA-256 value")
+	}
+	return values[0], true, nil
+}
+
+type candidateArtifactResult struct {
+	digest string
+	found  bool
+	err    error
+}
+
+func (p *Proxy) acquireArtifactInventorySlot(ctx context.Context) error {
+	select {
+	case p.artifactInventorySlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Proxy) releaseArtifactInventorySlot() {
+	<-p.artifactInventorySlots
+}
+
+func (p *Proxy) candidateInventoryDigest(
+	ctx context.Context,
+	cand candidate,
+	model string,
+	path string,
+) (string, bool, error) {
+	if err := p.acquireArtifactInventorySlot(ctx); err != nil {
+		return "", false, err
+	}
+	defer p.releaseArtifactInventorySlot()
+
+	target := *cand.url
+	target.Path = path
+	target.RawPath = ""
+	target.RawQuery = ""
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return "", false, err
+	}
+	request.Header.Set("Accept", "application/json")
+	client := &http.Client{
+		Timeout:   modelListClient.Timeout,
+		Transport: p.candidateTransport(cand),
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		p.targets.Forget(cand.id)
+		return "", false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("inventory %s returned %s", path, response.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxModelListBytes+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(body) > maxModelListBytes {
+		return "", false, fmt.Errorf("inventory %s exceeds %d bytes", path, maxModelListBytes)
+	}
+	var envelope struct {
+		Models *[]json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", false, err
+	}
+	if envelope.Models == nil {
+		return "", false, fmt.Errorf("inventory %s has no model array", path)
+	}
+	requested := ollamaModelKey(model)
+	var digest string
+	matches := 0
+	for _, raw := range *envelope.Models {
+		var identity struct {
+			Name   string `json:"name"`
+			Model  string `json:"model"`
+			Digest string `json:"digest"`
+		}
+		if err := json.Unmarshal(raw, &identity); err != nil {
+			return "", false, fmt.Errorf("invalid model record from %s: %w", path, err)
+		}
+		if identity.Name != "" && identity.Model != "" && ollamaModelKey(identity.Name) != ollamaModelKey(identity.Model) {
+			return "", false, fmt.Errorf("model record from %s has conflicting identities", path)
+		}
+		identityKey := identity.Name
+		if identityKey == "" {
+			identityKey = identity.Model
+		}
+		if ollamaModelKey(identityKey) != requested {
+			continue
+		}
+		matches++
+		digest = identity.Digest
+	}
+	if matches == 0 {
+		return "", false, nil
+	}
+	if matches != 1 || !validArtifactSHA256(digest) {
+		return "", false, fmt.Errorf("requested model record from %s is ambiguous or has an invalid digest", path)
+	}
+	return digest, true, nil
+}
+
+// candidateModelDigest reads the candidate's native Ollama inventory through
+// the same transport used for inference. The returned digest is bound only to
+// one unambiguous record for the requested model in this request-local read.
+func (p *Proxy) candidateModelDigest(ctx context.Context, cand candidate, model string) (string, bool, error) {
+	return p.candidateInventoryDigest(ctx, cand, model, "/api/tags")
+}
+
+// candidateLoadedModelDigest reads Ollama's scheduler-owned live process
+// inventory. Ollama derives this digest from the exact Model object held by the
+// loaded runner, so it closes the gap between an installed tag and the model
+// that was actually selected for the response now waiting to commit.
+func (p *Proxy) candidateLoadedModelDigest(ctx context.Context, cand candidate, model string) (string, bool, error) {
+	return p.candidateInventoryDigest(ctx, cand, model, "/api/ps")
+}
+
+// filterCandidatesByArtifact intersects the already model-eligible, ordered
+// candidate list with a bounded request-local digest inventory. The order is
+// retained so manual selection, scheduler priority, and failover semantics do
+// not change. Each retained candidate carries the immutable digest value read
+// for this request, which is later stamped only if that candidate commits.
+func (p *Proxy) filterCandidatesByArtifact(ctx context.Context, candidates []candidate, model, expected string) ([]candidate, bool) {
+	results := make([]candidateArtifactResult, len(candidates))
+	workerCount := min(len(candidates), maxArtifactInventoryConcurrency)
+	jobs := make(chan int, len(candidates))
+	for i := range candidates {
+		jobs <- i
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i].digest, results[i].found, results[i].err = p.candidateModelDigest(ctx, candidates[i], model)
+			}
+		}()
+	}
+	wg.Wait()
+
+	available := false
+	matched := make([]candidate, 0, len(candidates))
+	for i, result := range results {
+		if result.err != nil {
+			slog.Debug("artifact inventory candidate unavailable",
+				"node_id", candidates[i].id, "target", candidates[i].url.Host, "err", result.err)
+			continue
+		}
+		available = true
+		if !result.found || result.digest != expected {
+			continue
+		}
+		cand := candidates[i]
+		cand.artifactDigest = result.digest
+		matched = append(matched, cand)
+	}
+	return matched, available
 }
 
 // serveModelList queries every Ollama candidate concurrently and returns the
@@ -1142,11 +1442,50 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// routing behavior even when their JSON happens to contain a model field.
 	bodyBytes, model := bufferBodyAndModel(r)
 	isInf := isInferenceRequest(r.Method, r.URL.Path)
+	expectedArtifact, artifactBound, artifactErr := expectedArtifactSHA256(r.Header, r.Trailer)
+	removeReservedArtifactFields(r.Header)
+	removeReservedArtifactFields(r.Trailer)
+	if artifactBound && (artifactErr != nil || !isInf || model == "") {
+		cors.Apply(w.Header())
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid artifact binding"}`)
+		p.codec.Notify("proxy/request", RequestEvent{
+			ID: reqID, Method: r.Method, Path: r.URL.Path, Status: http.StatusBadRequest,
+			Duration: time.Since(start).Milliseconds(), Error: "invalid artifact binding",
+		})
+		return
+	}
 	routingModel := ""
 	if isInf {
 		routingModel = model
 	}
 	candidates := p.resolveCandidates(routingModel)
+	if artifactBound && len(candidates) > 0 {
+		var inventoryAvailable bool
+		candidates, inventoryAvailable = p.filterCandidatesByArtifact(r.Context(), candidates, model, expectedArtifact)
+		if len(candidates) == 0 {
+			status := http.StatusPreconditionFailed
+			errorText := "no candidate matches requested model artifact"
+			body := `{"error":"requested model artifact is unavailable"}`
+			if !inventoryAvailable {
+				status = http.StatusServiceUnavailable
+				errorText = "artifact inventory unavailable"
+				body = `{"error":"model artifact inventory is unavailable"}`
+			}
+			cors.Apply(w.Header())
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+			p.codec.Notify("proxy/request", RequestEvent{
+				ID: reqID, Method: r.Method, Path: r.URL.Path, Status: status,
+				Duration: time.Since(start).Milliseconds(), Error: errorText,
+			})
+			return
+		}
+	}
 	if isInf && model != "" {
 		candidates = p.reserveCandidate(candidates)
 	}
@@ -1322,6 +1661,8 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 		retry := false
+		artifactFailureStatus := 0
+		artifactFailureError := ""
 		sc := &statusCapture{ResponseWriter: w, status: http.StatusOK, idle: idleClientWriteTimeout}
 
 		proxy := &httputil.ReverseProxy{
@@ -1329,6 +1670,8 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				req.URL.Scheme = cand.url.Scheme
 				req.URL.Host = cand.url.Host
 				req.Host = cand.url.Host
+				removeReservedArtifactFields(req.Header)
+				removeReservedArtifactFields(req.Trailer)
 			},
 			// A remote cluster peer is dialed over mTLS (per-peer pinned config);
 			// self/manual candidates use the plain transport. See candidateTransport.
@@ -1337,11 +1680,39 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			// have arrived but before the body streams. That's both the retry
 			// decision point and, on commit, the time-to-first-byte boundary.
 			ModifyResponse: func(resp *http.Response) error {
+				// This is a reserved proxy trust signal. Never pass through a value
+				// supplied by an engine or another intermediary.
+				removeReservedArtifactFields(resp.Header)
+				removeReservedArtifactFields(resp.Trailer)
+				resp.Body = &artifactTrailerSanitizingBody{ReadCloser: resp.Body, trailer: resp.Trailer}
 				if !last && shouldRetry(resp.StatusCode) {
 					// Abort before streaming: ReverseProxy closes resp.Body and
 					// calls ErrorHandler with our sentinel, then we try next.
 					retry = true
 					return retrySignal{}
+				}
+				if artifactBound {
+					loadedDigest, found, err := p.candidateLoadedModelDigest(r.Context(), cand, model)
+					switch {
+					case err != nil:
+						artifactFailureStatus = http.StatusServiceUnavailable
+						artifactFailureError = "loaded model artifact inventory is unavailable"
+						slog.Debug("loaded artifact verification unavailable",
+							"node_id", cand.id, "target", cand.url.Host, "err", err)
+					case !found:
+						artifactFailureStatus = http.StatusPreconditionFailed
+						artifactFailureError = "requested model artifact is not loaded"
+					case loadedDigest != cand.artifactDigest:
+						artifactFailureStatus = http.StatusPreconditionFailed
+						artifactFailureError = "loaded model artifact does not match the requested digest"
+					}
+					if artifactFailureStatus != 0 {
+						if !last {
+							retry = true
+						}
+						return artifactVerificationSignal{}
+					}
+					resp.Header.Set(servedArtifactSHA256Header, cand.artifactDigest)
 				}
 				// Prefer an engine-declared preflight policy so an exact origin plus
 				// Allow-Credentials can pass a credentialed browser fetch. Engines
@@ -1403,6 +1774,24 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			ErrorHandler: func(ew http.ResponseWriter, _ *http.Request, err error) {
 				if _, ok := err.(retrySignal); ok {
 					return // retryable status — the loop advances to the next candidate
+				}
+				if _, ok := err.(artifactVerificationSignal); ok {
+					if !last {
+						return // uncommitted artifact response — try the next candidate
+					}
+					servedNodeID = cand.id
+					servedTarget = cand.url.Host
+					proxyErr = artifactFailureError
+					body, marshalErr := json.Marshal(map[string]string{"error": artifactFailureError})
+					if marshalErr != nil {
+						body = []byte(`{"error":"model artifact verification failed"}`)
+					}
+					cors.Apply(ew.Header())
+					ew.Header().Set("Content-Type", "application/json")
+					ew.Header().Set("X-Content-Type-Options", "nosniff")
+					ew.WriteHeader(artifactFailureStatus)
+					_, _ = ew.Write(body)
+					return
 				}
 				// Transport/dial error (not a status-based retry): forget this
 				// node's confirmed address so the next request re-confirms and
